@@ -1,0 +1,14 @@
+
+syntax = "proto3";
+
+option go_package = "main";
+
+service echo{
+    rpc Hi(msg)returns(msg);
+    rpc Sleep(msg)returns(msg);
+}
+
+message msg {
+    string msg = 1;
+    int32 sleep = 2;
+}
