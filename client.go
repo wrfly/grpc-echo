@@ -13,6 +13,11 @@ import (
 )
 
 func runClient(servers []string) {
+	LB := Register()
+	go func() {
+		time.Sleep(time.Second * 3)
+		LB.UpdateBackends(nil)
+	}()
 
 	conn, err := grpc.Dial(strings.Join(servers, ","),
 		grpc.WithInsecure(),
