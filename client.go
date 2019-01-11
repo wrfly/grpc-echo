@@ -4,20 +4,23 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/keepalive"
 )
 
-func runClient(port int) {
+func runClient(servers []string) {
 
-	conn, err := grpc.Dial(fmt.Sprintf("localhost:%d", port),
+	conn, err := grpc.Dial(strings.Join(servers, ","),
 		grpc.WithInsecure(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    time.Second * 18,
 			Timeout: time.Second * 17,
 		}),
+		grpc.WithBalancerName(roundrobin.Name),
 	)
 	if err != nil {
 		log.Panicf("dial err:%s", err)
