@@ -1,31 +1,25 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/resolver"
 )
 
 // schemes
 const (
-	ListBuilderScheme = "list_builder"
+	listBuilderScheme = "list"
+	etcdBuilderScheme = "etcd"
 )
 
-// ListBuilder can build a resolver from a backend list
-// and can also update the backends
-type ListBuilder interface {
-	Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOption) (resolver.Resolver, error)
-	UpdateBackends(backends []string) error
+// Builder can build a resolver from a backend list
+type Builder interface {
 	Target() string
-}
-
-// ListResolver implements the resolver.Resolver
-type ListResolver interface {
-	ResolveNow(opts resolver.ResolveNowOption)
-	Close()
 }
 
 // global list endpoints
@@ -35,15 +29,12 @@ var (
 )
 
 func init() {
-	globalListMutex.Lock()
-	defer globalListMutex.Unlock()
 	globalListEndpoints = make(map[string][]string, 0)
-	resolver.SetDefaultScheme(ListBuilderScheme)
 }
 
-// listResolver implements the resolver.Resolver and
+// rResolver implements the resolver.Resolver and
 // has an `UpdateBackends` function to update its servers
-type listResolver struct {
+type rResolver struct {
 	cc resolver.ClientConn
 
 	m        sync.Mutex
@@ -52,17 +43,17 @@ type listResolver struct {
 }
 
 // ResolveNow could be called multiple times concurrently.
-func (lr *listResolver) ResolveNow(opts resolver.ResolveNowOption) {
-	// update backends
-	lr.m.Lock()
-	avaliable, _ := healthCheck(lr.backends)
-	lr.m.Unlock()
+func (rr *rResolver) ResolveNow(opts resolver.ResolveNowOption) {
+	// check avaliable endpoints
+	avaliable, _ := healthCheck(rr.backends)
 
 	hash := fmt.Sprint(avaliable)
-	if lr.hash == hash {
+	if rr.hash == hash {
 		return
 	}
-	lr.hash = hash
+	rr.m.Lock()
+	rr.hash = hash
+	rr.m.Unlock()
 
 	addresses := []resolver.Address{}
 	for _, e := range avaliable {
@@ -74,27 +65,25 @@ func (lr *listResolver) ResolveNow(opts resolver.ResolveNowOption) {
 			},
 		)
 	}
-	lr.cc.NewAddress(addresses)
+	rr.cc.NewAddress(addresses)
 }
 
 // Close closes the resolver.
-func (lr *listResolver) Close() {
+func (rr *rResolver) Close() {
 	// close file or close net conn
 }
 
-func (lr *listResolver) updateBackends(list []string) error {
+func (rr *rResolver) updateBackends(list []string) error {
 	// health check first
 	aliveBackends, failedBackends := healthCheck(list)
 
 	// update backends
-	lr.m.Lock()
-	lr.backends = aliveBackends
-	lr.m.Unlock()
-
-	fmt.Printf("updateBackends: %v %v %v %v\n", list, aliveBackends, failedBackends, lr.backends)
+	rr.m.Lock()
+	rr.backends = aliveBackends
+	rr.m.Unlock()
 
 	// resolve immediately
-	lr.ResolveNow(resolver.ResolveNowOption{})
+	rr.ResolveNow(resolver.ResolveNowOption{})
 
 	if len(failedBackends) != 0 {
 		return fmt.Errorf("failed backends: %v", failedBackends)
@@ -118,66 +107,110 @@ func healthCheck(list []string) ([]string, []string) {
 	return aliveBackends, failedBackends
 }
 
-// listBuilder can build a resolver who can update backends
-// from a server list
-type listBuilder struct {
-	name string
-	lr   *listResolver
+// rBuilder is resolver builder
+type rBuilder struct {
+	id      string
+	rr      *rResolver
+	scheme  string
+	etcdURL string
 }
 
 // Build a resolver
-func (lb *listBuilder) Build(target resolver.Target, cc resolver.ClientConn,
+func (rb *rBuilder) Build(target resolver.Target, cc resolver.ClientConn,
 	opts resolver.BuildOption) (resolver.Resolver, error) {
+
 	backends := globalListEndpoints[target.Endpoint]
-	lb.lr = &listResolver{
+	rb.rr = &rResolver{
 		cc:       cc,
 		backends: backends,
 	}
-	if err := lb.lr.updateBackends(backends); err != nil {
+	if err := rb.rr.updateBackends(backends); err != nil {
 		return nil, err
 	}
 
-	go func() {
-		for {
-			time.Sleep(time.Second)
-			lb.lr.ResolveNow(resolver.ResolveNowOption{})
-		}
-	}()
-
-	return lb.lr, nil
+	return rb.rr, nil
 }
 
 // Scheme returns the lb scheme
-func (lb *listBuilder) Scheme() string {
-	return ListBuilderScheme
+func (rb *rBuilder) Scheme() string {
+	return rb.scheme
 }
 
-func (lb *listBuilder) Target() string {
-	return lb.name
+func (rb *rBuilder) Target() string {
+	return rb.scheme + ":///" + rb.id
 }
 
-// UpdateBackends can update the gRPC backend list
-func (lb *listBuilder) UpdateBackends(backends []string) error {
-	if lb.lr == nil {
+func (rb *rBuilder) updateBackends(backends []string) error {
+	if rb.rr == nil {
 		return fmt.Errorf("resolver is nil")
 	}
 	globalListMutex.Lock()
 	defer globalListMutex.Unlock()
-	globalListEndpoints[lb.name] = backends
+	globalListEndpoints[rb.id] = backends
 
-	return lb.lr.updateBackends(backends)
+	return rb.rr.updateBackends(backends)
 }
 
-// RegisterListLB register new list builder LoadBalancer
-func RegisterListLB(name string, initialBackends []string) ListBuilder {
-	lb := &listBuilder{
-		name: name,
+func (rb *rBuilder) watch() {
+	conn, err := grpc.Dial(rb.Target(), grpc.WithInsecure())
+	if err != nil {
+		panic(err)
+	}
+	ctx := context.Background()
+	if err == nil {
+		for {
+			state := conn.GetState()
+			if conn.WaitForStateChange(ctx, state) {
+				fmt.Println("state change, resolve now")
+				rb.resolve()
+			}
+		}
+	}
+}
+
+func (rb *rBuilder) resolve() {
+	rb.rr.ResolveNow(resolver.ResolveNowOption{})
+}
+
+func (rb *rBuilder) queryKey(etcd string) ([]string, error) {
+	// TODO:
+	return []string{"localhost:50001", "localhost:50002"}, nil
+}
+
+func (rb *rBuilder) watchKey(etcd string) []string {
+	// TODO:
+	return nil
+}
+
+// Register register new list builder LoadBalancer
+func Register(etcdURL string, initialBackends ...string) (Builder, error) {
+	scheme := listBuilderScheme
+	if etcdURL != "" {
+		scheme = etcdBuilderScheme
+	}
+	rb := &rBuilder{
+		id:      fmt.Sprint(time.Now().Unix()),
+		scheme:  scheme,
+		etcdURL: etcdURL,
+	}
+
+	// etcd get initialBackends
+	if rb.scheme == etcdBuilderScheme {
+		gotBackends, err := rb.queryKey(etcdURL)
+		if err != nil {
+			return nil, err
+		}
+		go rb.watchKey(etcdURL)
+		initialBackends = gotBackends
 	}
 
 	globalListMutex.Lock()
-	globalListEndpoints[lb.name] = initialBackends
+	globalListEndpoints[rb.id] = initialBackends
 	globalListMutex.Unlock()
 
-	resolver.Register(lb)
-	return lb
+	resolver.Register(rb)
+
+	go rb.watch()
+
+	return rb, nil
 }

@@ -13,11 +13,10 @@ import (
 
 func runClient(servers []string) {
 
-	testLB := RegisterListLB("test", servers)
-	// go func() {
-	// 	time.Sleep(time.Second * 3)
-	// 	testLB.UpdateBackends(servers[1:])
-	// }()
+	testLB, err := Register("/etcd/key")
+	if err != nil {
+		log.Panicf("register error: %s", err)
+	}
 
 	conn, err := grpc.Dial(testLB.Target(),
 		grpc.WithInsecure(),
