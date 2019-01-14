@@ -3,23 +3,47 @@ package main
 import (
 	"fmt"
 	"net"
-	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc/resolver"
 )
 
-// ListBuilderScheme for server backend list builder
-const ListBuilderScheme = "list_builder"
+// schemes
+const (
+	ListBuilderScheme = "list_builder"
+)
 
-func init() {
-	resolver.SetDefaultScheme(ListBuilderScheme)
-	resolver.Register(&ListBuilder{})
+// ListBuilder can build a resolver from a backend list
+// and can also update the backends
+type ListBuilder interface {
+	Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOption) (resolver.Resolver, error)
+	UpdateBackends(backends []string) error
+	Target() string
 }
 
-// ListResolver implements the resolver.Resolver and
+// ListResolver implements the resolver.Resolver
+type ListResolver interface {
+	ResolveNow(opts resolver.ResolveNowOption)
+	Close()
+}
+
+// global list endpoints
+var (
+	globalListEndpoints map[string][]string
+	globalListMutex     sync.Mutex
+)
+
+func init() {
+	globalListMutex.Lock()
+	defer globalListMutex.Unlock()
+	globalListEndpoints = make(map[string][]string, 0)
+	resolver.SetDefaultScheme(ListBuilderScheme)
+}
+
+// listResolver implements the resolver.Resolver and
 // has an `UpdateBackends` function to update its servers
-type ListResolver struct {
+type listResolver struct {
 	cc resolver.ClientConn
 
 	m        sync.Mutex
@@ -28,22 +52,25 @@ type ListResolver struct {
 }
 
 // ResolveNow could be called multiple times concurrently.
-func (lr *ListResolver) ResolveNow(opts resolver.ResolveNowOption) {
+func (lr *listResolver) ResolveNow(opts resolver.ResolveNowOption) {
+	// update backends
 	lr.m.Lock()
-	defer lr.m.Unlock()
+	avaliable, _ := healthCheck(lr.backends)
+	lr.m.Unlock()
 
-	if lr.hash == fmt.Sprint(lr.backends) {
+	hash := fmt.Sprint(avaliable)
+	if lr.hash == hash {
 		return
 	}
-	lr.hash = fmt.Sprint(lr.backends)
+	lr.hash = hash
 
 	addresses := []resolver.Address{}
-	for _, endpoint := range lr.backends {
+	for _, e := range avaliable {
 		addresses = append(addresses,
 			resolver.Address{
-				Addr:       endpoint,
+				Addr:       e,
 				Type:       resolver.Backend,
-				ServerName: endpoint,
+				ServerName: e,
 			},
 		)
 	}
@@ -51,62 +78,106 @@ func (lr *ListResolver) ResolveNow(opts resolver.ResolveNowOption) {
 }
 
 // Close closes the resolver.
-func (lr *ListResolver) Close() {
+func (lr *listResolver) Close() {
 	// close file or close net conn
 }
 
-// UpdateBackends can update the gRPC backend list
-func (lr *ListResolver) UpdateBackends(list []string) error {
-	// preflight
-	for _, e := range list {
-		c, err := net.Dial("tcp", e)
-		if err != nil {
-			return err
-		}
-		c.Close()
-	}
+func (lr *listResolver) updateBackends(list []string) error {
+	// health check first
+	aliveBackends, failedBackends := healthCheck(list)
 
 	// update backends
 	lr.m.Lock()
-	lr.backends = list
+	lr.backends = aliveBackends
 	lr.m.Unlock()
+
+	fmt.Printf("updateBackends: %v %v %v %v\n", list, aliveBackends, failedBackends, lr.backends)
 
 	// resolve immediately
 	lr.ResolveNow(resolver.ResolveNowOption{})
 
+	if len(failedBackends) != 0 {
+		return fmt.Errorf("failed backends: %v", failedBackends)
+	}
+
 	return nil
 }
 
-// ListBuilder can build a resolver who can update backends
+func healthCheck(list []string) ([]string, []string) {
+	aliveBackends, failedBackends := []string{}, []string{}
+	for _, e := range list {
+		conn, err := net.Dial("tcp", e)
+		if err != nil {
+			failedBackends = append(failedBackends, e)
+			continue
+		}
+		conn.Close()
+		aliveBackends = append(aliveBackends, e)
+	}
+
+	return aliveBackends, failedBackends
+}
+
+// listBuilder can build a resolver who can update backends
 // from a server list
-type ListBuilder struct {
-	lr *ListResolver
+type listBuilder struct {
+	name string
+	lr   *listResolver
 }
 
 // Build a resolver
-func (lb *ListBuilder) Build(target resolver.Target, cc resolver.ClientConn,
+func (lb *listBuilder) Build(target resolver.Target, cc resolver.ClientConn,
 	opts resolver.BuildOption) (resolver.Resolver, error) {
+	backends := globalListEndpoints[target.Endpoint]
+	lb.lr = &listResolver{
+		cc:       cc,
+		backends: backends,
+	}
+	if err := lb.lr.updateBackends(backends); err != nil {
+		return nil, err
+	}
 
-	lb.lr = &ListResolver{cc: cc}
-	return lb.lr, lb.lr.UpdateBackends(strings.Split(target.Endpoint, ","))
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			lb.lr.ResolveNow(resolver.ResolveNowOption{})
+		}
+	}()
+
+	return lb.lr, nil
 }
 
 // Scheme returns the lb scheme
-func (lb *ListBuilder) Scheme() string {
+func (lb *listBuilder) Scheme() string {
 	return ListBuilderScheme
 }
 
+func (lb *listBuilder) Target() string {
+	return lb.name
+}
+
 // UpdateBackends can update the gRPC backend list
-func (lb *ListBuilder) UpdateBackends(list []string) error {
+func (lb *listBuilder) UpdateBackends(backends []string) error {
 	if lb.lr == nil {
 		return fmt.Errorf("resolver is nil")
 	}
-	return lb.lr.UpdateBackends(list)
+	globalListMutex.Lock()
+	defer globalListMutex.Unlock()
+	globalListEndpoints[lb.name] = backends
+
+	return lb.lr.updateBackends(backends)
 }
 
-// Register new list builder LoadBalancer
-func Register() *ListBuilder {
-	lb := &ListBuilder{}
+// RegisterListLB register new list builder LoadBalancer
+func RegisterListLB(name string, initialBackends []string) ListBuilder {
+	lb := &listBuilder{
+		name: name,
+	}
+
+	globalListMutex.Lock()
+	globalListEndpoints[lb.name] = initialBackends
+	globalListMutex.Unlock()
+
 	resolver.Register(lb)
 	return lb
 }

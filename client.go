@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -13,13 +12,14 @@ import (
 )
 
 func runClient(servers []string) {
-	LB := Register()
-	go func() {
-		time.Sleep(time.Second * 3)
-		LB.UpdateBackends(nil)
-	}()
 
-	conn, err := grpc.Dial(strings.Join(servers, ","),
+	testLB := RegisterListLB("test", servers)
+	// go func() {
+	// 	time.Sleep(time.Second * 3)
+	// 	testLB.UpdateBackends(servers[1:])
+	// }()
+
+	conn, err := grpc.Dial(testLB.Target(),
 		grpc.WithInsecure(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    time.Second * 18,
@@ -27,8 +27,9 @@ func runClient(servers []string) {
 		}),
 		grpc.WithBalancerName(roundrobin.Name),
 	)
+
 	if err != nil {
-		log.Panicf("dial err:%s", err)
+		log.Panicf("dial err: %s", err)
 	}
 
 	ctx := context.Background()
@@ -59,7 +60,7 @@ func runClient(servers []string) {
 		fmt.Scanln(&input)
 		got, err := client.Hi(ctx, &Msg{Msg: input})
 		if err != nil {
-			log.Printf("error: %s", err)
+			log.Printf("error: %s\n", err)
 			continue
 		}
 		if input != got.GetMsg() {

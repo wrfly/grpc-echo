@@ -32,7 +32,6 @@ func runServer(port int) {
 	s := grpc.NewServer(
 		grpc.ConnectionTimeout(time.Second),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionAge:  time.Second * 5,
 			MaxConnectionIdle: time.Second * 10,
 			Timeout:           time.Second * 20,
 		}),
