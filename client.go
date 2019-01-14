@@ -4,67 +4,42 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/balancer/roundrobin"
 )
 
 func runClient(servers []string) {
 
-	testLB, err := Register("/etcd/key")
+	testRR, err := Register("/etcd/key")
 	if err != nil {
 		log.Panicf("register error: %s", err)
 	}
-
 	go func() {
-		for err := range testLB.Errors() {
-			log.Printf("lb error: %s", err)
+		for err := range testRR.Errors() {
+			log.Printf("resolver error: %s", err)
 		}
 	}()
 
-	conn, err := grpc.Dial(testLB.Target(),
-		grpc.WithInsecure(),
-		grpc.WithBalancerName(roundrobin.Name),
-	)
+	conn, err := testRR.DialWithRR()
 	if err != nil {
 		log.Panicf("dial err: %s", err)
 	}
+	log.Printf("conn stat: %s", conn.GetState())
+	defer conn.Close()
+	go printStateChange(conn, "conn")
 
-	// conn, err := testLB.DialWithRR(
-	// 	grpc.WithKeepaliveParams(keepalive.ClientParameters{
-	// 		Time:    time.Second * 18,
-	// 		Timeout: time.Second * 17,
-	// 	}),
-	// )
-	// if err != nil {
-	// 	log.Panicf("dial err: %s", err)
-	// }
-
-	// conn2, err := testLB.DialWithRR(
-	// 	grpc.WithKeepaliveParams(keepalive.ClientParameters{
-	// 		Time:    time.Second * 18,
-	// 		Timeout: time.Second * 17,
-	// 	}),
-	// )
-	// if err != nil {
-	// 	log.Panicf("dial err: %s", err)
-	// }
-	// conn2.Close()
-
-	ctx := context.Background()
-
-	go func() {
-		for {
-			state := conn.GetState()
-			if conn.WaitForStateChange(ctx, state) {
-				log.Printf("stage change %s->%s", state, conn.GetState())
-			}
-		}
-	}()
+	conn2, err := testRR.DialWithRR()
+	if err != nil {
+		log.Panicf("dial err: %s", err)
+	}
+	log.Printf("conn2 stat: %s", conn2.GetState())
+	defer conn2.Close()
+	go printStateChange(conn2, "conn2")
 
 	client := NewEchoClient(conn)
 
-	// // sleep test
+	// sleep test
 	// for i := 0; i < 100; i++ {
 	// 	go func(index int) {
 	// 		client.Sleep(ctx, &Msg{Sleep: 5})
@@ -73,18 +48,30 @@ func runClient(servers []string) {
 	// }
 	// log.Printf("---")
 
-	var input string
-	for {
-		fmt.Printf("input: ")
-		fmt.Scanln(&input)
-		got, err := client.Hi(ctx, &Msg{Msg: input})
+	for input := ""; ; input = "" {
+		input = fmt.Sprint(time.Now().Second())
+		got, err := client.Hi(context.Background(), &Msg{Msg: input})
 		if err != nil {
 			log.Printf("error: %s\n", err)
+			time.Sleep(time.Second * 5)
+			if err := testRR.ReConnect(); err != nil {
+				log.Printf("reconnect error: %s\n", err)
+			}
 			continue
 		}
 		if input != got.GetMsg() {
 			panic(input)
 		}
-		input = ""
+		time.Sleep(time.Second)
+	}
+}
+
+func printStateChange(conn *grpc.ClientConn, name string) {
+	for {
+		state := conn.GetState()
+		if conn.WaitForStateChange(context.Background(), state) {
+			log.Printf("[%s] stage change %s->%s",
+				name, state, conn.GetState())
+		}
 	}
 }

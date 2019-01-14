@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -18,29 +19,50 @@ const (
 	etcdBuilderScheme = "etcd"
 )
 
-// Builder can build a resolver from a backend list
-type Builder interface {
-	Target() string
-	DialWithRR(opts ...grpc.DialOption) (*grpc.ClientConn, error)
-	Errors() <-chan error
-}
-
-// global list endpoints
 var (
-	globalListEndpoints map[string][]string
-	globalListMutex     sync.Mutex
+	etcdRBuilder resolveBuilder
+	listRBuilder resolveBuilder
+
+	dialOptions = []grpc.DialOption{
+		grpc.WithInsecure(),
+		grpc.WithBalancerName(roundrobin.Name),
+	}
 )
 
 func init() {
-	globalListEndpoints = make(map[string][]string, 0)
+	etcdRBuilder = &rBuilder{
+		scheme:   etcdBuilderScheme,
+		rrs:      make(map[string]*rResolver, 0),
+		backends: make(map[string][]string, 0),
+	}
+
+	listRBuilder = &rBuilder{
+		scheme:   listBuilderScheme,
+		rrs:      make(map[string]*rResolver, 0),
+		backends: make(map[string][]string, 0),
+	}
+
+	resolver.Register(etcdRBuilder)
+	resolver.Register(listRBuilder)
+}
+
+type Resolver interface {
+	Errors() <-chan error
+	Target() string
+	DialWithRR(opts ...grpc.DialOption) (*grpc.ClientConn, error)
+	ReConnect() error
 }
 
 // rResolver implements the resolver.Resolver and
 // has an `UpdateBackends` function to update its servers
 type rResolver struct {
-	cc resolver.ClientConn
+	ccs []resolver.ClientConn
 
-	m        sync.Mutex
+	id      string
+	m       sync.Mutex
+	etcdURL string
+	scheme  string
+
 	backends []string
 	hash     string
 	errChan  chan error
@@ -67,7 +89,7 @@ func (rr *rResolver) ResolveNow(opts resolver.ResolveNowOption) {
 	}
 	rr.hash = hash
 
-	fmt.Printf("update backends %v\n", avaliable)
+	fmt.Printf("%s update backends %v\n", rr.id, avaliable)
 
 	addresses := []resolver.Address{}
 	for _, e := range avaliable {
@@ -79,12 +101,40 @@ func (rr *rResolver) ResolveNow(opts resolver.ResolveNowOption) {
 			},
 		)
 	}
-	rr.cc.NewAddress(addresses)
+	for _, cc := range rr.ccs {
+		cc.NewAddress(addresses)
+	}
+}
+
+func (rr *rResolver) ReConnect() error {
+	// check avaliable endpoints
+	avaliable, _ := healthCheck(rr.backends)
+	if len(avaliable) == 0 {
+		return fmt.Errorf("no backends avaliable")
+	}
+	rr.ResolveNow(resolver.ResolveNowOption{})
+	return nil
 }
 
 // Close closes the resolver.
 func (rr *rResolver) Close() {
 	// close file or close net conn
+}
+
+func (rr *rResolver) Errors() <-chan error {
+	return rr.errChan
+}
+
+func (rr *rResolver) Target() string {
+	return rr.scheme + ":///" + rr.id
+}
+
+func (rr *rResolver) DialWithRR(opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	conn, err := grpc.Dial(rr.Target(), dialOptions...)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (rr *rResolver) updateBackends(backends []string) error {
@@ -110,6 +160,32 @@ func (rr *rResolver) updateBackends(backends []string) error {
 	return nil
 }
 
+func (rr *rResolver) watchBackends() {
+	conn, err := rr.DialWithRR()
+	if err != nil {
+		panic(err) // panic at first time
+	}
+	for {
+		state := conn.GetState()
+		if conn.WaitForStateChange(context.Background(), state) {
+			if conn.GetState() != state {
+				rr.ResolveNow(resolver.ResolveNowOption{})
+			}
+		}
+	}
+}
+
+func (rr *rResolver) queryKey() ([]string, error) {
+	// TODO:
+	return []string{"localhost:50001", "localhost:50002"}, nil
+}
+
+func (rr *rResolver) watchKey() {
+	// TODO:
+	// newBackends := nil
+	// rb.rr.updateBackends(newBackends)
+}
+
 func healthCheck(list []string) ([]string, []string) {
 	aliveBackends, failedBackends := []string{}, []string{}
 	for _, e := range list {
@@ -125,24 +201,41 @@ func healthCheck(list []string) ([]string, []string) {
 	return aliveBackends, failedBackends
 }
 
+type resolveBuilder interface {
+	Scheme() string
+	AddResolver(r *rResolver)
+	Build(resolver.Target, resolver.ClientConn, resolver.BuildOption) (resolver.Resolver, error)
+}
+
 // rBuilder is resolver builder
 type rBuilder struct {
-	id      string
-	rr      *rResolver
-	scheme  string
-	etcdURL string
+	scheme   string
+	m        sync.Mutex
+	rrs      map[string]*rResolver
+	backends map[string][]string
 }
 
 // Build a resolver
 func (rb *rBuilder) Build(target resolver.Target, cc resolver.ClientConn,
 	opts resolver.BuildOption) (resolver.Resolver, error) {
 
-	rb.rr.cc = cc
-	globalListMutex.Lock()
-	backends := globalListEndpoints[target.Endpoint]
-	globalListMutex.Unlock()
+	rb.m.Lock()
+	defer rb.m.Unlock()
 
-	return rb.rr, rb.rr.updateBackends(backends)
+	id := target.Endpoint
+	rr := rb.rrs[id]
+	rr.ccs = append(rr.ccs, cc)
+	backends := rb.backends[id]
+
+	return rr, rr.updateBackends(backends)
+}
+
+// AddResolver can add a resolver to this builder
+func (rb *rBuilder) AddResolver(r *rResolver) {
+	rb.m.Lock()
+	rb.rrs[r.id] = r
+	rb.backends[r.id] = r.backends
+	rb.m.Unlock()
 }
 
 // Scheme returns the lb scheme
@@ -150,82 +243,53 @@ func (rb *rBuilder) Scheme() string {
 	return rb.scheme
 }
 
-func (rb *rBuilder) Target() string {
-	return rb.scheme + ":///" + rb.id
-}
-
-func (rb *rBuilder) DialWithRR(opts ...grpc.DialOption) (*grpc.ClientConn, error) {
-	return grpc.Dial(rb.Target(),
-		grpc.WithInsecure(),
-		grpc.WithBalancerName(roundrobin.Name),
-	)
-}
-
-func (rb *rBuilder) Errors() <-chan error {
-	return rb.rr.errChan
-}
-
-func (rb *rBuilder) watchBackends() {
-	conn, err := rb.DialWithRR()
-	if err != nil {
-		panic(err) // panic at first time
-	}
-	for {
-		state := conn.GetState()
-		if conn.WaitForStateChange(context.Background(), state) {
-			if conn.GetState() != state {
-				rb.resolve()
-			}
-		}
-	}
-}
-
-func (rb *rBuilder) resolve() {
-	rb.rr.ResolveNow(resolver.ResolveNowOption{})
-}
-
-func (rb *rBuilder) queryKey() ([]string, error) {
-	// TODO:
-	return []string{"localhost:50001", "localhost:50002"}, nil
-}
-
-func (rb *rBuilder) watchKey() {
-	// TODO:
-	// newBackends := nil
-	// rb.rr.updateBackends(newBackends)
-}
-
 // Register register new list builder LoadBalancer
-func Register(etcdURL string, initialBackends ...string) (Builder, error) {
-	scheme := listBuilderScheme
+func Register(etcdURL string, initialBackends ...string) (Resolver, error) {
+	var builder resolveBuilder
+	builder = listRBuilder
 	if etcdURL != "" {
-		scheme = etcdBuilderScheme
+		builder = etcdRBuilder
 	}
-	rb := &rBuilder{
-		id:      fmt.Sprint(time.Now().Unix()),
-		scheme:  scheme,
+	rr := &rResolver{
+		scheme:  builder.Scheme(),
 		etcdURL: etcdURL,
-		rr: &rResolver{
-			errChan: make(chan error, 10),
-		},
+		id:      randSeq(9),
+		ccs:     make([]resolver.ClientConn, 0),
+		errChan: make(chan error, 10),
 	}
 
 	// etcd get initialBackends
-	if rb.scheme == etcdBuilderScheme {
-		gotBackends, err := rb.queryKey()
+	if rr.scheme == etcdBuilderScheme {
+		remoteBackends, err := rr.queryKey()
 		if err != nil {
 			return nil, err
 		}
-		go rb.watchKey()
-		initialBackends = gotBackends
+		initialBackends = remoteBackends
+		go rr.watchKey()
 	}
-	resolver.Register(rb)
+	rr.backends = initialBackends
 
-	globalListMutex.Lock()
-	globalListEndpoints[rb.id] = initialBackends
-	globalListMutex.Unlock()
+	if rr.scheme == etcdBuilderScheme {
+		etcdRBuilder.AddResolver(rr)
+	} else {
+		listRBuilder.AddResolver(rr)
+	}
 
-	go rb.watchBackends()
+	go rr.watchBackends()
 
-	return rb, nil
+	return rr, nil
+}
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func randSeq(n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
 }
