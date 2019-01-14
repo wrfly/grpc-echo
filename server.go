@@ -11,10 +11,12 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
-type server struct{}
+type server struct {
+	port string
+}
 
 func (s *server) Hi(ctx context.Context, x *Msg) (*Msg, error) {
-	log.Printf("client send: [%s]", x.GetMsg())
+	log.Printf("[%s] got: [%s]", s.port, x.GetMsg())
 	return x, nil
 }
 
@@ -24,8 +26,8 @@ func (s *server) Sleep(ctx context.Context, x *Msg) (*Msg, error) {
 	return x, nil
 }
 
-func runServer(port int) {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+func runServer(port string) {
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
@@ -42,7 +44,7 @@ func runServer(port int) {
 			}),
 		grpc.MaxConcurrentStreams(5),
 	)
-	RegisterEchoServer(s, &server{})
+	RegisterEchoServer(s, &server{port})
 	// Register reflection service on gRPC server.
 	// reflection.Register(s)
 	if err := s.Serve(lis); err != nil {

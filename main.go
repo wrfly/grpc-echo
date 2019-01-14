@@ -7,13 +7,13 @@ import (
 )
 
 var (
-	port    int
+	ports   string
 	mode    string
 	servers string
 )
 
 func init() {
-	flag.IntVar(&port, "port", 50001, "server port")
+	flag.StringVar(&ports, "ports", "50001", "server ports")
 	flag.StringVar(&mode, "mode", "s", "run mode, s=server || c=client")
 	flag.StringVar(&servers, "servers", "localhost:50001", "server list, split with comma")
 	flag.Parse()
@@ -22,7 +22,9 @@ func init() {
 func main() {
 	if mode == "s" {
 		fmt.Println("run server")
-		go runServer(port)
+		for _, port := range strings.Split(ports, ",") {
+			go runServer(port)
+		}
 	} else if mode == "c" {
 		fmt.Println("run client")
 		runClient(strings.Split(servers, ","))
