@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/resolver"
 )
 
@@ -20,6 +21,8 @@ const (
 // Builder can build a resolver from a backend list
 type Builder interface {
 	Target() string
+	DialWithRR(opts ...grpc.DialOption) (*grpc.ClientConn, error)
+	Errors() <-chan error
 }
 
 // global list endpoints
@@ -40,20 +43,31 @@ type rResolver struct {
 	m        sync.Mutex
 	backends []string
 	hash     string
+	errChan  chan error
 }
 
 // ResolveNow could be called multiple times concurrently.
 func (rr *rResolver) ResolveNow(opts resolver.ResolveNowOption) {
+	rr.m.Lock()
+	defer rr.m.Unlock()
+
 	// check avaliable endpoints
-	avaliable, _ := healthCheck(rr.backends)
+	avaliable, failed := healthCheck(rr.backends)
+	if len(failed) != 0 {
+		err := fmt.Errorf("failed backends: %v", failed)
+		select {
+		case rr.errChan <- err:
+		default:
+		}
+	}
 
 	hash := fmt.Sprint(avaliable)
 	if rr.hash == hash {
 		return
 	}
-	rr.m.Lock()
 	rr.hash = hash
-	rr.m.Unlock()
+
+	fmt.Printf("update backends %v\n", avaliable)
 
 	addresses := []resolver.Address{}
 	for _, e := range avaliable {
@@ -73,20 +87,24 @@ func (rr *rResolver) Close() {
 	// close file or close net conn
 }
 
-func (rr *rResolver) updateBackends(list []string) error {
+func (rr *rResolver) updateBackends(backends []string) error {
 	// health check first
-	aliveBackends, failedBackends := healthCheck(list)
+	aliveBackends, failedBackends := healthCheck(backends)
 
 	// update backends
-	rr.m.Lock()
 	rr.backends = aliveBackends
-	rr.m.Unlock()
 
 	// resolve immediately
 	rr.ResolveNow(resolver.ResolveNowOption{})
 
 	if len(failedBackends) != 0 {
-		return fmt.Errorf("failed backends: %v", failedBackends)
+		err := fmt.Errorf("failed backends: %v", failedBackends)
+		select {
+		case rr.errChan <- err:
+			return err
+		default:
+			return err
+		}
 	}
 
 	return nil
@@ -119,16 +137,12 @@ type rBuilder struct {
 func (rb *rBuilder) Build(target resolver.Target, cc resolver.ClientConn,
 	opts resolver.BuildOption) (resolver.Resolver, error) {
 
+	rb.rr.cc = cc
+	globalListMutex.Lock()
 	backends := globalListEndpoints[target.Endpoint]
-	rb.rr = &rResolver{
-		cc:       cc,
-		backends: backends,
-	}
-	if err := rb.rr.updateBackends(backends); err != nil {
-		return nil, err
-	}
+	globalListMutex.Unlock()
 
-	return rb.rr, nil
+	return rb.rr, rb.rr.updateBackends(backends)
 }
 
 // Scheme returns the lb scheme
@@ -140,28 +154,26 @@ func (rb *rBuilder) Target() string {
 	return rb.scheme + ":///" + rb.id
 }
 
-func (rb *rBuilder) updateBackends(backends []string) error {
-	if rb.rr == nil {
-		return fmt.Errorf("resolver is nil")
-	}
-	globalListMutex.Lock()
-	defer globalListMutex.Unlock()
-	globalListEndpoints[rb.id] = backends
-
-	return rb.rr.updateBackends(backends)
+func (rb *rBuilder) DialWithRR(opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	return grpc.Dial(rb.Target(),
+		grpc.WithInsecure(),
+		grpc.WithBalancerName(roundrobin.Name),
+	)
 }
 
-func (rb *rBuilder) watch() {
-	conn, err := grpc.Dial(rb.Target(), grpc.WithInsecure())
+func (rb *rBuilder) Errors() <-chan error {
+	return rb.rr.errChan
+}
+
+func (rb *rBuilder) watchBackends() {
+	conn, err := rb.DialWithRR()
 	if err != nil {
-		panic(err)
+		panic(err) // panic at first time
 	}
-	ctx := context.Background()
-	if err == nil {
-		for {
-			state := conn.GetState()
-			if conn.WaitForStateChange(ctx, state) {
-				fmt.Println("state change, resolve now")
+	for {
+		state := conn.GetState()
+		if conn.WaitForStateChange(context.Background(), state) {
+			if conn.GetState() != state {
 				rb.resolve()
 			}
 		}
@@ -172,14 +184,15 @@ func (rb *rBuilder) resolve() {
 	rb.rr.ResolveNow(resolver.ResolveNowOption{})
 }
 
-func (rb *rBuilder) queryKey(etcd string) ([]string, error) {
+func (rb *rBuilder) queryKey() ([]string, error) {
 	// TODO:
 	return []string{"localhost:50001", "localhost:50002"}, nil
 }
 
-func (rb *rBuilder) watchKey(etcd string) []string {
+func (rb *rBuilder) watchKey() {
 	// TODO:
-	return nil
+	// newBackends := nil
+	// rb.rr.updateBackends(newBackends)
 }
 
 // Register register new list builder LoadBalancer
@@ -192,25 +205,27 @@ func Register(etcdURL string, initialBackends ...string) (Builder, error) {
 		id:      fmt.Sprint(time.Now().Unix()),
 		scheme:  scheme,
 		etcdURL: etcdURL,
+		rr: &rResolver{
+			errChan: make(chan error, 10),
+		},
 	}
 
 	// etcd get initialBackends
 	if rb.scheme == etcdBuilderScheme {
-		gotBackends, err := rb.queryKey(etcdURL)
+		gotBackends, err := rb.queryKey()
 		if err != nil {
 			return nil, err
 		}
-		go rb.watchKey(etcdURL)
+		go rb.watchKey()
 		initialBackends = gotBackends
 	}
+	resolver.Register(rb)
 
 	globalListMutex.Lock()
 	globalListEndpoints[rb.id] = initialBackends
 	globalListMutex.Unlock()
 
-	resolver.Register(rb)
-
-	go rb.watch()
+	go rb.watchBackends()
 
 	return rb, nil
 }

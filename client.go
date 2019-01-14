@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer/roundrobin"
-	"google.golang.org/grpc/keepalive"
 )
 
 func runClient(servers []string) {
@@ -18,18 +16,40 @@ func runClient(servers []string) {
 		log.Panicf("register error: %s", err)
 	}
 
+	go func() {
+		for err := range testLB.Errors() {
+			log.Printf("lb error: %s", err)
+		}
+	}()
+
 	conn, err := grpc.Dial(testLB.Target(),
 		grpc.WithInsecure(),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:    time.Second * 18,
-			Timeout: time.Second * 17,
-		}),
 		grpc.WithBalancerName(roundrobin.Name),
 	)
-
 	if err != nil {
 		log.Panicf("dial err: %s", err)
 	}
+
+	// conn, err := testLB.DialWithRR(
+	// 	grpc.WithKeepaliveParams(keepalive.ClientParameters{
+	// 		Time:    time.Second * 18,
+	// 		Timeout: time.Second * 17,
+	// 	}),
+	// )
+	// if err != nil {
+	// 	log.Panicf("dial err: %s", err)
+	// }
+
+	// conn2, err := testLB.DialWithRR(
+	// 	grpc.WithKeepaliveParams(keepalive.ClientParameters{
+	// 		Time:    time.Second * 18,
+	// 		Timeout: time.Second * 17,
+	// 	}),
+	// )
+	// if err != nil {
+	// 	log.Panicf("dial err: %s", err)
+	// }
+	// conn2.Close()
 
 	ctx := context.Background()
 
