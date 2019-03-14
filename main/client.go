@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/balancer/roundrobin"
-
+	// "google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc"
 
 	"github.com/wrfly/grpc-echo/pb"
@@ -22,9 +22,30 @@ func runClient(servers []string) {
 	conn, err := grpc.Dial(
 		target,
 
+		// some options
 		grpc.WithInsecure(),
 		grpc.WithBalancerName(roundrobin.Name),
+
+		// block until connected
 		grpc.WithBlock(),
+
+		// backoff policy
+		// grpc.WithBackoffConfig(grpc.BackoffConfig{
+		// 	MaxDelay: time.Second,
+		// }),
+		// grpc.WithBackoffMaxDelay(time.Second),
+
+		// disable healthcheck, seems not working
+		// grpc.WithDisableHealthCheck(),
+
+		// maybe works under high corrency
+		// grpc.WithDisableRetry(),
+
+		// care of this config, read the comments carefully
+		// grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		// 	Time:    time.Second,
+		// 	Timeout: time.Second * 5,
+		// }),
 	)
 	if err != nil {
 		log.Panicf("dial err: %s", err)
