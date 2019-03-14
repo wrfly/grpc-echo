@@ -14,33 +14,20 @@ type resolver struct {
 
 func (rsv *resolver) ResolveNow(opt r.ResolveNowOption) {
 	log.Printf("cc(%p) resolve now with servers: %v", rsv.cc, rsv.servers)
-
-	addrs := []r.Address{}
+	addrs := make([]r.Address, 0, len(rsv.servers))
 	for _, e := range rsv.servers {
-		addrs = append(addrs,
-			r.Address{
-				Addr:       e,
-				Type:       r.Backend,
-				ServerName: e,
-			},
-		)
+		addrs = append(addrs, r.Address{Addr: e})
 	}
 	rsv.cc.NewAddress(addrs)
 }
 
-func (r *resolver) Close() {
-	log.Printf("cc %p closed", r.cc)
-}
+func (r *resolver) Close() { log.Printf("cc %p closed", r.cc) }
 
 func newResolver(target r.Target, cc r.ClientConn) r.Resolver {
-	e := target.Endpoint
-	e = strings.TrimPrefix(e, "[")
-	e = strings.TrimSuffix(e, "]")
-
-	servers := strings.Split(e, " ")
-	log.Printf("new resolver for cc %p, servers: %v", cc, servers)
+	e := strings.TrimFunc(target.Endpoint,
+		func(r rune) bool { return r == '[' || r == ']' })
 	return &resolver{
-		servers: servers,
+		servers: strings.Split(e, " "),
 		cc:      cc,
 	}
 }
