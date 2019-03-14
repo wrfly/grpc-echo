@@ -9,18 +9,20 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+
+	"github.com/wrfly/grpc-echo/pb"
 )
 
 type server struct {
 	port string
 }
 
-func (s *server) Hi(ctx context.Context, x *Msg) (*Msg, error) {
+func (s *server) Hi(ctx context.Context, x *pb.Msg) (*pb.Msg, error) {
 	log.Printf("[%s] got: [%s]", s.port, x.GetMsg())
 	return x, nil
 }
 
-func (s *server) Sleep(ctx context.Context, x *Msg) (*Msg, error) {
+func (s *server) Sleep(ctx context.Context, x *pb.Msg) (*pb.Msg, error) {
 	log.Printf("client sleep: [%d]", x.GetSleep())
 	time.Sleep(time.Second * time.Duration(x.GetSleep()))
 	return x, nil
@@ -39,14 +41,12 @@ func runServer(port string) {
 		}),
 		grpc.KeepaliveEnforcementPolicy(
 			keepalive.EnforcementPolicy{
-				// MinTime: time.Second,
-				// PermitWithoutStream: true,
+				MinTime:             time.Second,
+				PermitWithoutStream: true,
 			}),
 		grpc.MaxConcurrentStreams(5),
 	)
-	RegisterEchoServer(s, &server{port})
-	// Register reflection service on gRPC server.
-	// reflection.Register(s)
+	pb.RegisterEchoServer(s, &server{port})
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}

@@ -1,26 +1,30 @@
 # makefile for echo service
 
+build: pb
+	go build -o bin/grpc-echo main/*.go
+
+.PHONY: pb
 pb:
-	protoc -I . echo.proto --go_out=plugins=grpc:.
+	protoc -I pb echo.proto --go_out=plugins=grpc:pb
 
-server:
-	go run *.go -mode s
+server: build
+	bin/grpc-echo -mode s
 
-client:
-	go run *.go -mode c
+client: build
+	bin/grpc-echo -mode c
 
-# go run *.go -mode s -port 50001
-# go run *.go -mode s -port 50002
-# go run *.go -mode c -servers localhost:50001,localhost:50002
+# bin/grpc-echo -mode s -port 50001
+# bin/grpc-echo -mode s -port 50002
+# bin/grpc-echo -mode c -servers localhost:50001,localhost:50002
 
-cs:
-	go run *.go -mode c -servers localhost:50001,localhost:50002
+cs: build
+	bin/grpc-echo -mode c -servers localhost:50001,localhost:50002
 
-ss:
-	go run *.go -mode s -ports 50001,50002
+ss: build
+	bin/grpc-echo -mode s -ports 50001,50002
 
-s1:
-	go run *.go -mode s -ports 50001
+s1: build
+	bin/grpc-echo -mode s -ports 50001
 
-s2:
-	go run *.go -mode s -ports 50002
+s2: build
+	bin/grpc-echo -mode s -ports 50002
