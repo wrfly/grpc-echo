@@ -16,7 +16,9 @@ import (
 
 func runClient(servers []string) {
 	target := servers[0]
-	if len(servers) == 2 {
+
+	// use the simple LB
+	if len(servers) > 1 {
 		target = simple.Target(servers)
 	}
 	conn, err := grpc.Dial(
